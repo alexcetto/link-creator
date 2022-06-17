@@ -1,10 +1,12 @@
 package main
 
 import (
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/hex"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,6 +15,8 @@ import (
 	"net/http"
 	"os"
 	"sync"
+
+	ecies "github.com/ecies/go/v2"
 
 	"github.com/go-logr/glogr"
 	"github.com/go-logr/logr"
@@ -23,10 +27,10 @@ import (
 var (
 	activityStore = make(map[string][]byte)
 
-	// Key created for each sending
-	mySuperSecretKey = ""
 	// Apsis redirection domain
 	domain = "localhost:8067"
+
+	mode string
 
 	l logr.Logger
 )
@@ -45,7 +49,9 @@ func initGlog() {
 func main() {
 	initGlog()
 	l = glogr.New()
-	mySuperSecretKey = os.Getenv("MY_SECRET")
+
+	mode = os.Getenv("MODE")
+
 	r := mux.NewRouter()
 	r.Path("/{sendingID}/{shortenedURL}").HandlerFunc(redirect)
 	r.Path("/{sendingID}").HandlerFunc(createNewID)
@@ -56,11 +62,19 @@ func redirect(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sendingID := vars["sendingID"]
 	shortenedURL := vars["shortenedURL"]
-	l.Info("Path", "sendingId", sendingID, "shortenedURL", shortenedURL, "value", string(activityStore[sendingID]))
+	l.Info("Path", "sendingId", sendingID, "shortenedURL", shortenedURL, "keyvalue", string(activityStore[sendingID]))
 
-	lengthened := lengthen(shortenedURL)
-	l.Info("lenghtened url", "lengthened", string(lengthened))
-	dec := decypher(lengthened, activityStore[sendingID])
+	var dec string
+	if mode == "aes" {
+		dec = aesdecypher(shortenedURL, activityStore[sendingID])
+	} else if mode == "rsa" {
+		dec = rsaDecipher(shortenedURL, rsa.PrivateKey{})
+	} else if mode == "ec" {
+		dec = ecDecipher(shortenedURL, activityStore[sendingID])
+	} else {
+		panic("chose a mode")
+	}
+
 	l.Info("deciphered", "url", dec)
 
 	http.Redirect(w, r, dec, http.StatusTemporaryRedirect)
@@ -87,76 +101,161 @@ func createNewID(w http.ResponseWriter, r *http.Request) {
 	}
 	l.Info("MyURL no transfo", "url", link.URL)
 
-	enc, nonce := cypher(link.URL)
-	l.Info("MyURL ciphered", "ciphered", string(enc))
-	short := shorten(enc)
-	l.Info("MyURL shortened", "short", short)
-
-	finalURL := fmt.Sprintf("http://" + domain + "/" + sendingID + "/" + short)
-	l.Info("FinalURL ", "value", finalURL)
-	activityStore[sendingID] = nonce
+	var finalURL string
+	if mode == "aes" {
+		finalURL = useAES([]byte(link.URL), sendingID)
+	} else if mode == "rsa" {
+		finalURL = useRSA([]byte(link.URL), sendingID)
+	} else if mode == "ec" {
+		finalURL = useEC([]byte(link.URL), sendingID)
+	} else {
+		panic("chose a mode")
+	}
 
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte(finalURL))
 	return
-
 }
 
-func shorten(a []byte) string {
-	return base62.StdEncoding.EncodeToString(a)
+func useAES(URL []byte, sendingID string) string {
+	// generate a new key for this sending
+	secretSendingKey := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, secretSendingKey); err != nil {
+		panic(err.Error())
+	}
+	enc := aescypher(URL, secretSendingKey)
+	l.Info("MyURL ciphered", "ciphered", enc)
+
+	finalURL := fmt.Sprintf("http://" + domain + "/" + sendingID + "/" + enc)
+	l.Info("FinalURL ", "value", finalURL)
+
+	// store the key to decrypt the URL later
+	activityStore[sendingID] = secretSendingKey
+	return finalURL
 }
 
-func lengthen(a string) []byte {
-	byteUrl, _ := base62.StdEncoding.DecodeString(a)
-	return byteUrl
-}
-
-func cypher(s string) ([]byte, []byte) {
-	// Load your secret key from a safe place and reuse it across multiple
-	// Seal/Open calls. (Obviously don't use this example key for anything
-	// real.) If you want to convert a passphrase to a key, use a suitable
-	// package like bcrypt or scrypt.
-	// When decoded the key should be 16 bytes (AES-128) or 32 (AES-256).
-	key, _ := hex.DecodeString(mySuperSecretKey)
-	plaintext := []byte(s)
-
+func aescypher(plaintext, key []byte) string {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	// Never use more than 2^32 random nonces with a given key because of the risk of a repeat.
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		panic(err.Error())
+	cipherText := make([]byte, aes.BlockSize+len(plaintext))
+	iv := cipherText[:aes.BlockSize]
+	if _, err = io.ReadFull(rand.Reader, iv); err != nil {
+		panic(err)
 	}
 
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		panic(err.Error())
-	}
+	stream := cipher.NewCFBEncrypter(block, iv)
+	stream.XORKeyStream(cipherText[aes.BlockSize:], plaintext)
 
-	ciphertext := aesgcm.Seal(nil, nonce, plaintext, nil)
-	return ciphertext, nonce
+	return base62.StdEncoding.EncodeToString(cipherText)
 }
 
-func decypher(c []byte, snonce []byte) string {
-	key, _ := hex.DecodeString(mySuperSecretKey)
+func aesdecypher(message string, key []byte) string {
+	cipherText, err := base62.StdEncoding.DecodeString(message)
+	if err != nil {
+		panic(err)
+	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		panic(err.Error())
+		panic(err)
 	}
 
-	aesgcm, err := cipher.NewGCM(block)
+	if len(cipherText) < aes.BlockSize {
+		panic("invalid ciphertext block size")
+	}
+
+	iv := cipherText[:aes.BlockSize]
+	cipherText = cipherText[aes.BlockSize:]
+
+	stream := cipher.NewCFBDecrypter(block, iv)
+	stream.XORKeyStream(cipherText, cipherText)
+
+	return string(cipherText)
+}
+
+func useEC(originalURL []byte, sendingID string) string {
+	// The GenerateKey method takes in a reader that returns random bits, and
+	// the number of bits
+	privateKey, err := ecies.GenerateKey()
 	if err != nil {
-		panic(err.Error())
+		panic(err)
 	}
 
-	plaintext, err := aesgcm.Open(nil, snonce, c, nil)
+	ciphertext, err := ecies.Encrypt(privateKey.PublicKey, originalURL)
 	if err != nil {
-		panic(err.Error())
+		panic(err)
+	}
+	l.Info("plaintext encrypted ", "value", string(ciphertext))
+
+	enc := base62.StdEncoding.EncodeToString(ciphertext)
+
+	finalURL := fmt.Sprintf("http://" + domain + "/" + sendingID + "/" + enc)
+	l.Info("FinalURL ", "value", finalURL)
+	// store the key to decrypt the URL later
+	activityStore[sendingID] = privateKey.Bytes()
+	return finalURL
+}
+
+func ecDecipher(msg string, key []byte) string {
+	cy, err := base62.StdEncoding.DecodeString(msg)
+	if err != nil {
+		panic(err)
+	}
+	priv := ecies.NewPrivateKeyFromBytes(key)
+	plaintext, err := ecies.Decrypt(priv, cy)
+	if err != nil {
+		panic(err)
+	}
+	return string(plaintext)
+}
+
+func useRSA(originalURL []byte, sendingID string) string {
+	// The GenerateKey method takes in a reader that returns random bits, and
+	// the number of bits
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
 	}
 
-	return fmt.Sprintf("%s", plaintext)
+	// The public key is a part of the *rsa.PrivateKey struct
+	publicKey := privateKey.PublicKey
+
+	enc := rsaCipher(originalURL, publicKey)
+
+	finalURL := fmt.Sprintf("http://" + domain + "/" + sendingID + "/" + enc)
+	l.Info("FinalURL ", "value", finalURL)
+	// store the key to decrypt the URL later
+	//activityStore[sendingID] = privateKey
+	return finalURL
+}
+
+func rsaCipher(msg []byte, pubKey rsa.PublicKey) string {
+	enc, err := rsa.EncryptOAEP(
+		sha256.New(),
+		rand.Reader,
+		&pubKey,
+		msg,
+		nil,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	return base62.StdEncoding.EncodeToString(enc)
+}
+
+func rsaDecipher(msg string, key rsa.PrivateKey) string {
+	b, err := base62.StdEncoding.DecodeString(msg)
+	if err != nil {
+		panic(err)
+	}
+	decryptedBytes, err := key.Decrypt(nil, b, &rsa.OAEPOptions{Hash: crypto.SHA256})
+	if err != nil {
+		panic(err)
+	}
+
+	return string(decryptedBytes)
 }
